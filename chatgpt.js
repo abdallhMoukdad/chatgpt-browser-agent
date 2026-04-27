@@ -41,7 +41,7 @@ const SESSION_FILE     = path.join(os.homedir(), '.chatgpt-poc-session');
 const DAEMON_FILE      = path.join(os.homedir(), '.chatgpt-poc-daemon.json');
 const DAEMON_LOG       = path.join(os.homedir(), '.chatgpt-poc-daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
-const RESPONSE_TIMEOUT = 120_000;
+const RESPONSE_TIMEOUT = 300_000; // 5 min — file analysis can be slow
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
@@ -108,6 +108,52 @@ function buildFullPrompt({ userPrompt, stdinData, fileData, gitData, contextData
 
 // ─── Browser helpers (daemon-side only) ───────────────────────────────────────
 
+/**
+ * Upload a local file to ChatGPT via direct CDP file-input injection.
+ *
+ * The ChatGPT composer always has a hidden <input id="upload-files"> in the DOM.
+ * Puppeteer's uploadFile() uses the Chrome DevTools Protocol to set files on
+ * the input element without needing a native file-picker dialog (which requires
+ * a real user gesture and cannot be triggered programmatically in headless mode).
+ * After setting the files via CDP we fire a synthetic change event so React's
+ * event system picks up the new FileList and registers the attachment.
+ */
+async function uploadFileToChatGPT(page, uploadPath, log) {
+  const abs = path.resolve(uploadPath);
+  if (!fs.existsSync(abs)) throw new Error(`Upload file not found: ${abs}`);
+  log(`Uploading file: ${abs}`);
+
+  await page.bringToFront();
+
+  // Wait for the hidden file input to be present in the DOM
+  const inputHandle = await page.waitForSelector('#upload-files', { timeout: 8_000 });
+
+  // CDP-level file injection — no dialog needed
+  await inputHandle.uploadFile(abs);
+
+  // Notify React that the input's FileList changed
+  await page.evaluate(() => {
+    const el = document.getElementById('upload-files');
+    if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+
+  // Give ChatGPT's React handler a moment to process the file and render a preview
+  await new Promise(r => setTimeout(r, 2_000));
+
+  // ChatGPT may show a "You've already uploaded this file" warning dialog when
+  // the same file has been uploaded recently.  Dismiss it so the flow continues.
+  const dialog = await page.$('[role="dialog"]');
+  if (dialog) {
+    const dialogText = await page.evaluate(el => el.textContent.trim().slice(0, 120), dialog);
+    log(`Dismissing dialog: "${dialogText}"`);
+    const okBtn = await page.$('[role="dialog"] button');
+    if (okBtn) await okBtn.click();
+    await new Promise(r => setTimeout(r, 800));
+  }
+
+  log('Upload complete.');
+}
+
 function launchBrowser() {
   return puppeteer.launch({
     executablePath: CHROME_PATH,
@@ -138,24 +184,57 @@ async function fillTextarea(page, text) {
   }, text);
 }
 
-async function waitForStreamingDone(page) {
-  await page.waitForFunction(
-    () => [...document.querySelectorAll('button')].some(
-      b => b.getAttribute('data-testid') === 'stop-button' ||
-           b.textContent.trim() === 'Stop streaming'
-    ),
-    { timeout: 15_000 }
-  ).catch(() => {});
+async function waitForStreamingDone(page, log, beforeCount) {
+  // beforeCount must be measured BEFORE the message is sent so we don't
+  // accidentally measure it after ChatGPT has already started responding.
+  // The caller passes it in; fall back to measuring now only for text-only paths.
+  if (beforeCount === undefined) {
+    beforeCount = await page.evaluate(
+      () => document.querySelectorAll('[data-message-author-role="assistant"]').length
+    );
+  }
+  log(`waitForStreamingDone: beforeCount=${beforeCount}`);
 
+  // Phase 1 — wait for a new assistant message to appear (ChatGPT started replying).
+  // polling:1000 reduces CDP round-trips on heavy pages and avoids
+  // "Runtime.callFunctionOn timed out" errors that occur with the default 100ms poll.
   await page.waitForFunction(
-    () => ![...document.querySelectorAll('button')].some(
-      b => b.getAttribute('data-testid') === 'stop-button' ||
-           b.textContent.trim() === 'Stop streaming'
-    ),
-    { timeout: RESPONSE_TIMEOUT }
-  );
+    before => {
+      const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+      if (msgs.length <= before) return false;
+      // Also ensure the last message has at least some text
+      return (msgs[msgs.length - 1].innerText || '').trim().length > 0;
+    },
+    { timeout: RESPONSE_TIMEOUT, polling: 1_000 },
+    beforeCount
+  ).catch(async err => {
+    // On timeout, dump the DOM state to the log for debugging
+    const dump = await page.evaluate(() => {
+      const assistants = [...document.querySelectorAll('[data-message-author-role="assistant"]')]
+        .map(el => el.innerText.trim().slice(0, 100));
+      const allRoles = [...document.querySelectorAll('[data-message-author-role]')]
+        .map(el => `${el.getAttribute('data-message-author-role')}: ${(el.innerText||'').trim().slice(0,80)}`);
+      const buttons = [...document.querySelectorAll('button')].map(b => b.getAttribute('aria-label') || b.textContent.trim().slice(0,30)).filter(Boolean);
+      const url = location.href;
+      return { assistants, allRoles, buttons: buttons.slice(0,15), url };
+    }).catch(() => ({ error: 'page.evaluate failed' }));
+    log(`waitForStreamingDone TIMEOUT dump: ${JSON.stringify(dump)}`);
+    throw err;
+  });
 
-  await new Promise(r => setTimeout(r, 300));
+  // Phase 2 — wait for the message to stop growing (streaming complete).
+  // Three consecutive 600 ms checks with identical length = done.
+  let lastLen = -1;
+  let stableCount = 0;
+  while (stableCount < 3) {
+    await new Promise(r => setTimeout(r, 600));
+    const len = await page.evaluate(() => {
+      const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+      return msgs.length > 0 ? msgs[msgs.length - 1].innerText.length : 0;
+    });
+    if (len === lastLen && len > 0) stableCount++;
+    else { lastLen = len; stableCount = 0; }
+  }
 }
 
 async function extractLastAssistantMessage(page) {
@@ -240,8 +319,8 @@ async function startDaemonProcess() {
       let body = '';
       req.on('data', chunk => (body += chunk));
       req.on('end', async () => {
-        const { fullPrompt, codeOnly, newChat } = JSON.parse(body);
-        log(`ask: newChat=${newChat} codeOnly=${codeOnly} len=${fullPrompt.length}`);
+        const { fullPrompt, codeOnly, newChat, uploadPath } = JSON.parse(body);
+        log(`ask: newChat=${newChat} codeOnly=${codeOnly} upload=${uploadPath||'none'} len=${fullPrompt.length}`);
 
         try {
           const currentUrl = page.url();
@@ -259,11 +338,41 @@ async function startDaemonProcess() {
           }
           // else: already on the right chat page, skip navigation entirely
 
+          if (uploadPath) await uploadFileToChatGPT(page, uploadPath, log);
+
           await fillTextarea(page, fullPrompt);
+
+          // If a file was uploaded, wait until the send button is enabled.
+          // ChatGPT uploads the file to its servers in the background; the send
+          // button stays disabled until that upload finishes.  Clicking a disabled
+          // button does nothing, which is what caused the previous silent failures.
+          if (uploadPath) {
+            log('Waiting for send button to become enabled (file upload in progress)...');
+            await page.waitForFunction(
+              () => {
+                const btn = document.querySelector('button[data-testid="send-button"]');
+                return btn && !btn.disabled;
+              },
+              { timeout: 60_000 }
+            );
+            log('Send button is now enabled.');
+          }
+
+          // Snapshot assistant count BEFORE submitting so waitForStreamingDone
+          // can reliably detect the new response even if ChatGPT replies instantly.
+          const beforeCount = await page.evaluate(
+            () => document.querySelectorAll('[data-message-author-role="assistant"]').length
+          );
+
+          // Submit by pressing Enter in the focused textarea.
+          // Clicking the send button is unreliable when text is selected or when
+          // a file attachment is present — React handles keyboard Enter more robustly.
+          await page.focus('#prompt-textarea');
           await page.keyboard.press('Enter');
+          log('Submitted via Enter key');
 
           log('Prompt sent, waiting for response...');
-          await waitForStreamingDone(page);
+          await waitForStreamingDone(page, log, beforeCount);
 
           const finalUrl = page.url();
           if (finalUrl.startsWith('https://chatgpt.com/c/')) {
@@ -404,8 +513,8 @@ async function login() {
 function parseArgs(argv) {
   const args = argv.slice(2);
   const opts = {
-    login: false, codeOnly: false, file: null, git: false,
-    context: null, newChat: false, stop: false, status: false,
+    login: false, codeOnly: false, file: null, upload: null, save: null,
+    git: false, context: null, newChat: false, stop: false, status: false,
     daemonInternal: false, cwd: null, prompt: [],
   };
   for (let i = 0; i < args.length; i++) {
@@ -418,6 +527,8 @@ function parseArgs(argv) {
       case '--status':          opts.status         = true;  break;
       case '--daemon-internal': opts.daemonInternal = true;  break;
       case '--file':            opts.file    = args[++i];    break;
+      case '--upload':          opts.upload  = args[++i];    break;
+      case '--save':            opts.save    = args[++i];    break;
       case '--context':         opts.context = args[++i];    break;
       case '--cwd':             opts.cwd     = args[++i];    break;
       default:                  opts.prompt.push(args[i]);
@@ -433,7 +544,9 @@ Usage:
   node chatgpt.js "prompt"                              # continue last chat (daemon auto-starts)
   node chatgpt.js --new "prompt"                        # force a new chat
   node chatgpt.js --code "write fizzbuzz in Go"         # extract code blocks only
-  node chatgpt.js --file <path> "prompt"                # attach a file
+  node chatgpt.js --file <path> "prompt"                # paste file content as text in prompt
+  node chatgpt.js --upload <path> "prompt"              # upload file via ChatGPT attachment button
+  node chatgpt.js --save <path> "prompt"                # save response to a file
   node chatgpt.js --git "write a commit message"        # attach git diff/status
   node chatgpt.js --context "we use Fiber v2" "prompt"  # inline context
   cat error.log | node chatgpt.js "what is wrong"       # pipe input
@@ -492,11 +605,16 @@ Usage:
     const port   = await ensureDaemon();
     const result = await httpPost(port, '/ask', {
       fullPrompt, codeOnly: opts.codeOnly, newChat: opts.newChat,
+      uploadPath: opts.upload || null,
     });
     if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
     console.log('\n--- RESPONSE ---');
     console.log(result.response);
     console.log('--- END ---\n');
+    if (opts.save) {
+      fs.writeFileSync(path.resolve(opts.save), result.response, 'utf8');
+      console.error(`[*] Response saved to: ${path.resolve(opts.save)}`);
+    }
   } catch (err) {
     console.error('[ERROR]', err.message);
     process.exit(1);

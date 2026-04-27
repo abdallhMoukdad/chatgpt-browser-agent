@@ -70,6 +70,14 @@ const TOOLS = [
           type: 'boolean',
           description: 'If true, start a fresh conversation instead of continuing the last one',
         },
+        file: {
+          type: 'string',
+          description: 'Absolute path to a local file to upload to ChatGPT via the attachment button',
+        },
+        savePath: {
+          type: 'string',
+          description: 'Absolute path where ChatGPT\'s response should be saved as a text file',
+        },
       },
       required: ['prompt'],
     },
@@ -100,6 +108,7 @@ function cacheKey(args) {
     nc: !!args.newChat,
     co: !!args.codeOnly,
     g:  !!args.git,
+    f:  args.file      || '',
   });
 }
 
@@ -179,6 +188,8 @@ function handleRequest(req) {
         flags.push('--cwd', process.cwd());
       }
       if (args.context)  flags.push('--context', args.context);
+      if (args.file)     flags.push('--upload',  args.file);
+      if (args.savePath) flags.push('--save',    args.savePath);
       flags.push(args.prompt);
 
       const text = runChatgpt(flags);
