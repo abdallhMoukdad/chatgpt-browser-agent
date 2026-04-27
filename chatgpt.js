@@ -29,6 +29,7 @@ puppeteer.use(StealthPlugin());
 
 const CHROME_PATH      = '/usr/bin/google-chrome';
 const PROFILE_DIR      = path.join(os.homedir(), '.chatgpt-poc-profile');
+const SESSION_FILE     = path.join(os.homedir(), '.chatgpt-poc-session');
 const CHATGPT_URL      = 'https://chatgpt.com';
 const RESPONSE_TIMEOUT = 120_000;
 
@@ -137,14 +138,26 @@ async function login() {
   console.log('      node chatgpt.js "your prompt here"');
 }
 
-async function ask({ fullPrompt, codeOnly }) {
+async function ask({ fullPrompt, codeOnly, newChat }) {
   console.log('[*] Launching Chrome...');
   const browser = await launchBrowser(false);
   const page = await browser.newPage();
 
   try {
+    // Determine start URL: resume last session unless --new is given
+    let startUrl = CHATGPT_URL;
+    if (!newChat && fs.existsSync(SESSION_FILE)) {
+      const saved = fs.readFileSync(SESSION_FILE, 'utf8').trim();
+      if (saved.startsWith('https://chatgpt.com/c/')) {
+        startUrl = saved;
+        console.log('[*] Resuming previous conversation...');
+      }
+    } else if (newChat) {
+      console.log('[*] Starting new conversation...');
+    }
+
     console.log('[*] Navigating to chatgpt.com...');
-    await page.goto(CHATGPT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
+    await page.goto(startUrl, { waitUntil: 'networkidle2', timeout: 30_000 });
 
     // Detect logged-out state
     const isLoggedOut = await page.evaluate(() => {
@@ -160,8 +173,6 @@ async function ask({ fullPrompt, codeOnly }) {
       process.exit(1);
     }
 
-    // Fresh chat
-    await page.goto(CHATGPT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
     const inputSelector = '#prompt-textarea';
     await page.waitForSelector(inputSelector, { timeout: 15_000 });
 
@@ -197,6 +208,12 @@ async function ask({ fullPrompt, codeOnly }) {
 
     await new Promise(r => setTimeout(r, 500));
 
+    // Save the chat URL so the next call can resume it
+    const currentUrl = page.url();
+    if (currentUrl.startsWith('https://chatgpt.com/c/')) {
+      fs.writeFileSync(SESSION_FILE, currentUrl, 'utf8');
+    }
+
     const raw = await page.evaluate(() => {
       const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
       if (msgs.length > 0) return msgs[msgs.length - 1].innerText.trim();
@@ -224,7 +241,7 @@ async function ask({ fullPrompt, codeOnly }) {
 
 function parseArgs(argv) {
   const args = argv.slice(2);
-  const opts = { login: false, codeOnly: false, file: null, git: false, context: null, prompt: [] };
+  const opts = { login: false, codeOnly: false, file: null, git: false, context: null, newChat: false, prompt: [] };
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -233,6 +250,7 @@ function parseArgs(argv) {
       case '--git':     opts.git     = true;           break;
       case '--file':    opts.file    = args[++i];      break;
       case '--context': opts.context = args[++i];      break;
+      case '--new':     opts.newChat = true;            break;
       default:          opts.prompt.push(args[i]);
     }
   }
@@ -243,7 +261,8 @@ function printHelp() {
   console.log(`
 Usage:
   node chatgpt.js --login                              # first-time setup
-  node chatgpt.js "prompt"                             # ask anything
+  node chatgpt.js "prompt"                             # continue last chat
+  node chatgpt.js --new "prompt"                       # force a new chat
   node chatgpt.js --code "write fizzbuzz in Go"        # extract code only
   node chatgpt.js --file <path> "prompt"               # attach a file
   node chatgpt.js --git "write a commit message"       # attach git context
@@ -274,6 +293,6 @@ Usage:
 
   const fullPrompt = buildFullPrompt({ userPrompt, stdinData, fileData, gitData, contextData });
 
-  await ask({ fullPrompt, codeOnly: opts.codeOnly })
+  await ask({ fullPrompt, codeOnly: opts.codeOnly, newChat: opts.newChat })
     .catch(err => { console.error('[ERROR]', err.message); process.exit(1); });
 })();
