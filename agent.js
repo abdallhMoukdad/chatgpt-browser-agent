@@ -127,14 +127,23 @@ function askUser(question) {
 
 // ─── Execute RUN commands ─────────────────────────────────────────────────────
 
-function execCommands(commands, cwd) {
+async function execCommands(commands, cwd, auto) {
   const results = [];
   for (const cmd of commands) {
     console.log(`\n$ ${cmd}`);
-    const result = spawnSync(cmd, { shell: true, encoding: 'utf8', cwd, timeout: 30_000 });
-    const output = (result.stdout + result.stderr).trim() || '(no output)';
-    console.log(output);
-    results.push({ cmd, output });
+    let run = 'y';
+    if (!auto) {
+      run = await askUser('Run this command? [y/n] ');
+    }
+    if (run === 'y' || run === '') {
+      const result = spawnSync(cmd, { shell: true, encoding: 'utf8', cwd, timeout: 30_000 });
+      const output = (result.stdout + result.stderr).trim() || '(no output)';
+      console.log(output);
+      results.push({ cmd, output });
+    } else {
+      console.log('  ✗ Skipped');
+      results.push({ cmd, output: '(skipped by user)' });
+    }
   }
   return results;
 }
@@ -188,7 +197,7 @@ function runCheck(cmd, cwd) {
   const result = spawnSync(cmd, { shell: true, encoding: 'utf8', cwd });
   const output = (result.stdout + result.stderr).trim();
   console.log(output || '(no output)');
-  return output;
+  return { output, failed: result.status !== 0 };
 }
 
 // ─── Main loop ────────────────────────────────────────────────────────────────
@@ -230,15 +239,14 @@ async function main() {
 
     // ── Execute requested commands ───────────────────────────────────────────
     if (runCmds.length > 0) {
-      const results = execCommands(runCmds, args.cwd);
-      // Feed results back automatically — no user input needed
-      prompt = `Command results:\n\n${buildCommandResults(results)}`;
-
-      // If there are also file changes in the same response, apply them first
+      // Apply file changes BEFORE running commands (files may be needed by the commands)
       if (changes.length > 0) {
         await applyChanges(changes, args.cwd, args.auto);
         if (args.check) runCheck(args.check, args.cwd);
       }
+      const results = await execCommands(runCmds, args.cwd, args.auto);
+      // Feed results back automatically — no user input needed
+      prompt = `Command results:\n\n${buildCommandResults(results)}`;
       continue; // next autonomous turn
     }
 
@@ -246,11 +254,11 @@ async function main() {
     if (changes.length > 0) {
       await applyChanges(changes, args.cwd, args.auto);
       if (args.check) {
-        const checkOut = runCheck(args.check, args.cwd);
+        const check = runCheck(args.check, args.cwd);
         // If check failed, feed output back and let ChatGPT fix it
-        if (checkOut && (checkOut.includes('Error') || checkOut.includes('error') || checkOut.includes('FAIL'))) {
+        if (check.failed) {
           console.log('\n[check failed — sending output back to ChatGPT]');
-          prompt = `The check command failed. Here is the output:\n\n${checkOut}\n\nPlease fix the errors.`;
+          prompt = `The check command failed. Here is the output:\n\n${check.output}\n\nPlease fix the errors.`;
           continue;
         }
       }
