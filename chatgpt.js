@@ -75,8 +75,8 @@ function readFile(filePath) {
   return fs.readFileSync(abs, 'utf8');
 }
 
-function getGitContext() {
-  const run = cmd => { try { return execSync(cmd, { encoding: 'utf8' }).trim(); } catch { return ''; } };
+function getGitContext(cwd) {
+  const run = cmd => { try { return execSync(cmd, { encoding: 'utf8', cwd }).trim(); } catch { return ''; } };
   const branch = run('git branch --show-current');
   const status = run('git status --short');
   const diff   = run('git diff HEAD');
@@ -406,7 +406,7 @@ function parseArgs(argv) {
   const opts = {
     login: false, codeOnly: false, file: null, git: false,
     context: null, newChat: false, stop: false, status: false,
-    daemonInternal: false, prompt: [],
+    daemonInternal: false, cwd: null, prompt: [],
   };
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -419,6 +419,7 @@ function parseArgs(argv) {
       case '--daemon-internal': opts.daemonInternal = true;  break;
       case '--file':            opts.file    = args[++i];    break;
       case '--context':         opts.context = args[++i];    break;
+      case '--cwd':             opts.cwd     = args[++i];    break;
       default:                  opts.prompt.push(args[i]);
     }
   }
@@ -482,7 +483,7 @@ Usage:
   const userPrompt  = opts.prompt.join(' ');
   const stdinData   = await readStdin();
   const fileData    = opts.file    ? readFile(opts.file)  : null;
-  const gitData     = opts.git     ? getGitContext()       : null;
+  const gitData     = opts.git     ? getGitContext(opts.cwd || process.cwd()) : null;
   const contextData = opts.context || null;
 
   const fullPrompt = buildFullPrompt({ userPrompt, stdinData, fileData, gitData, contextData });
