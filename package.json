@@ -1,0 +1,14 @@
+{
+  "name": "chatgpt-poc",
+  "version": "1.0.0",
+  "description": "POC: send a prompt to chatgpt.com and return the response",
+  "main": "chatgpt.js",
+  "scripts": {
+    "start": "node chatgpt.js"
+  },
+  "dependencies": {
+    "puppeteer-core": "^22.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
