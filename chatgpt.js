@@ -41,7 +41,6 @@ const SESSION_FILE     = path.join(os.homedir(), '.chatgpt-poc-session');
 const DAEMON_FILE      = path.join(os.homedir(), '.chatgpt-poc-daemon.json');
 const DAEMON_LOG       = path.join(os.homedir(), '.chatgpt-poc-daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
-const DAEMON_PORT      = 9001;   // change if this port is already in use
 const RESPONSE_TIMEOUT = 120_000;
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -290,9 +289,15 @@ async function startDaemonProcess() {
     send(404, { ok: false, error: 'Not found' });
   });
 
-  server.listen(DAEMON_PORT, '127.0.0.1', () => {
-    log(`HTTP server listening on 127.0.0.1:${DAEMON_PORT}`);
-    fs.writeFileSync(DAEMON_FILE, JSON.stringify({ port: DAEMON_PORT, pid: process.pid }), 'utf8');
+  server.on('error', err => {
+    log(`HTTP server error: ${err.message}`);
+    process.exit(1);
+  });
+
+  server.listen(0, '127.0.0.1', () => {
+    const { port } = server.address();
+    log(`HTTP server listening on 127.0.0.1:${port}`);
+    fs.writeFileSync(DAEMON_FILE, JSON.stringify({ port, pid: process.pid }), 'utf8');
     log('Daemon ready.');
   });
 
