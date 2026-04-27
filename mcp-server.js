@@ -86,6 +86,37 @@ const TOOLS = [
   },
 ];
 
+// ─── Dedup cache ──────────────────────────────────────────────────────────────
+// Prevents the model from hitting ChatGPT multiple times with the same prompt
+// within a short window (common when small models loop before outputting).
+
+const CACHE_TTL = 60_000; // 60 seconds
+const cache     = new Map(); // key → { text, ts }
+
+function cacheKey(args) {
+  return JSON.stringify({
+    p:  args.prompt    || '',
+    c:  args.context   || '',
+    nc: !!args.newChat,
+    co: !!args.codeOnly,
+    g:  !!args.git,
+  });
+}
+
+function cacheGet(args) {
+  const hit = cache.get(cacheKey(args));
+  if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.text;
+  return null;
+}
+
+function cachePut(args, text) {
+  cache.set(cacheKey(args), { text, ts: Date.now() });
+  // Evict stale entries
+  for (const [k, v] of cache) {
+    if (Date.now() - v.ts > CACHE_TTL) cache.delete(k);
+  }
+}
+
 // ─── Request dispatcher ───────────────────────────────────────────────────────
 
 function handleRequest(req) {
@@ -132,6 +163,13 @@ function handleRequest(req) {
     }
 
     if (name === 'chatgpt_ask') {
+      // Return cached result if same prompt was called recently
+      const cached = cacheGet(args);
+      if (cached) {
+        send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: cached }] } });
+        return;
+      }
+
       const flags = [];
       if (args.newChat)  flags.push('--new');
       if (args.codeOnly) flags.push('--code');
@@ -144,6 +182,7 @@ function handleRequest(req) {
       flags.push(args.prompt);
 
       const text = runChatgpt(flags);
+      cachePut(args, text);
       send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
       return;
     }
