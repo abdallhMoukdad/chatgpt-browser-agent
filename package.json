@@ -1,7 +1,7 @@
 {
-  "name": "chatgpt-poc",
+  "name": "chatgpt-browser-agent",
   "version": "1.0.0",
-  "description": "POC: send a prompt to chatgpt.com and return the response",
+  "description": "Persistent browser daemon + MCP server + agentic loop that routes prompts to chatgpt.com — no API key required",
   "main": "chatgpt.js",
   "scripts": {
     "start": "node chatgpt.js"
